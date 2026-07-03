@@ -24,7 +24,7 @@ from ovos_utils.list_utils import flatten_list
 from ovos_utils.log import LOG
 from ovos_utils.parse import match_one, MatchStrategy
 from ovos_utils.xdg_utils import xdg_data_home
-from ovos_spec_tools import LocaleResources, render
+from ovos_spec_tools import LocaleResources, render, SpecMessage
 
 from ovos_persona.memory import BasicShortTermMemory
 from ovos_persona.solvers import QuestionSolversService, get_utterance_handler_plugins
@@ -131,7 +131,7 @@ class PersonaService(ConfidenceMatcherPipeline):
         self.bus.on('persona:list', self.handle_persona_list)
         self.bus.on('persona:check', self.handle_persona_check)
         self.bus.on('persona:release', self.handle_persona_release)
-        self.bus.on("speak", self.handle_speak)
+        self.bus.on(SpecMessage.SPEAK.value, self.handle_speak)
         self.bus.on("recognizer_loop:utterance", self.handle_utterance)
         # OVOS-PERSONA-1 §8.5 out-of-band query / §8.7 discovery (bus-level,
         # outside the pipeline; registered directly on the bus, not as intents)
@@ -159,11 +159,11 @@ class PersonaService(ConfidenceMatcherPipeline):
 
     def _speak(self, utterance: str, message: Optional[Message] = None,
                lang: Optional[str] = None):
-        """Emit a ``speak`` bus message with the given utterance, forwarding the
-        session/context of ``message`` (replaces OVOSAbstractApplication.speak)."""
-        message = message or dig_for_message() or Message("speak")
+        """Speak an utterance on the OVOS-AUDIO speak topic, forwarding the
+        session/context of ``message``."""
+        message = message or dig_for_message() or Message(SpecMessage.SPEAK.value)
         lang = lang or self._msg_lang(message)
-        self.bus.emit(message.forward("speak",
+        self.bus.emit(message.forward(SpecMessage.SPEAK.value,
                                       {"utterance": utterance,
                                        "expect_response": False,
                                        "lang": lang,
@@ -171,8 +171,8 @@ class PersonaService(ConfidenceMatcherPipeline):
 
     def _speak_dialog(self, name: str, data: Optional[Dict] = None,
                       message: Optional[Message] = None, lang: Optional[str] = None):
-        """Render a dialog via ovos-spec-tools and speak it (replaces
-        OVOSAbstractApplication.speak_dialog). Uses the same locale/.dialog files."""
+        """Render a dialog from this package's locale ``.dialog`` files and
+        speak it."""
         message = message or dig_for_message()
         lang = lang or self._msg_lang(message)
         rendered = render(self._locale.load_dialog(name, lang), data or {})
