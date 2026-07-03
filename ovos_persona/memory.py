@@ -78,7 +78,7 @@ class BasicShortTermMemory(AgentContextManager):
         if message_history:
             # drop any hanging user messages without a corresponding response
             # for any non-verbal actions that OVOS may take
-            while message_history[-1].role == MessageRole.USER:
+            while message_history and message_history[-1].role == MessageRole.USER:
                 message_history.pop()
 
         if self.system_prompt.strip():

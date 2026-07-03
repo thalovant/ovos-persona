@@ -70,9 +70,7 @@ def test_per_session_active_personas_attribute():
 
     with patch("ovos_persona.PersonaService.load_personas"), \
          patch("ovos_persona.PersonaService.load_intent_files"), \
-         patch("ovos_persona.OVOSAbstractApplication.__init__"), \
-         patch("ovos_persona.ConfidenceMatcherPipeline.__init__"), \
-         patch.object(PersonaService, "add_event"):
+         patch("ovos_persona.ConfidenceMatcherPipeline.__init__"):
         svc = PersonaService.__new__(PersonaService)
         svc.config = {}
         svc.message_history = {}

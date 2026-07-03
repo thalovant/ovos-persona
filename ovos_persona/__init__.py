@@ -6,6 +6,7 @@ from typing import Optional, Dict, List, Union, Iterable
 from langcodes import closest_match
 from ovos_bus_client import Session
 from ovos_bus_client.client import MessageBusClient
+from ovos_bus_client.handler import HandlerLifecycle
 from ovos_bus_client.message import Message, dig_for_message
 from ovos_bus_client.session import SessionManager
 from ovos_config.config import Configuration
@@ -23,7 +24,7 @@ from ovos_utils.list_utils import flatten_list
 from ovos_utils.log import LOG
 from ovos_utils.parse import match_one, MatchStrategy
 from ovos_utils.xdg_utils import xdg_data_home
-from ovos_workshop.app import OVOSAbstractApplication
+from ovos_spec_tools import LocaleResources, render
 
 from ovos_persona.memory import BasicShortTermMemory
 from ovos_persona.solvers import QuestionSolversService, get_utterance_handler_plugins
@@ -87,7 +88,7 @@ class Persona:
         return self.solvers.stream_completion(messages, sess.lang, sess.system_unit)
 
 
-class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
+class PersonaService(ConfidenceMatcherPipeline):
     INTENTS = ["ask.intent", "summon.intent", "list_personas.intent", "active_persona.intent"]
 
     def __init__(self, bus: Optional[Union[MessageBusClient, FakeBus]] = None,
@@ -108,36 +109,84 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         """
         bus = bus or FakeBus()
         config = config or Configuration().get("intents", {}).get("persona", {})
-        OVOSAbstractApplication.__init__(self, bus=bus, skill_id="persona.openvoiceos",
-                                         resources_dir=f"{dirname(__file__)}")
         ConfidenceMatcherPipeline.__init__(self, bus=bus, config=config)
+        # persona Matches carry this skill_id; keep it as a plain attribute so the
+        # §8 handler-lifecycle done-signal correlates under the same id.
+        self.skill_id = "persona.openvoiceos"
+        # spec-tools resource loader (.voc/.dialog under locale/), matching
+        # StopService — replaces the OVOSAbstractApplication voc/dialog helpers.
+        self._locale = LocaleResources(skill_locale=join(dirname(__file__), "locale"))
         self.active_personas = {}  # per session_id
         self.personas = {}
         self.intent_matchers = {}
         self.blacklist = self.config.get("persona_blacklist") or []
         self.load_personas(self.config.get("personas_path"))
-        # OVOS-PIPELINE-1 §8: handler_info makes each dispatched handler emit the
-        # framework done-signal (mycroft.skill.handler.complete/.error, keyed by
-        # this service's skill_id) so the orchestrator's IntentDispatcher fires
-        # the §9.5 ovos.utterance.handled end-marker for persona matches.
-        self.add_event('persona:query', self.handle_persona_query,
-                       handler_info='mycroft.skill.handler', is_intent=True)
-        self.add_event('persona:summon', self.handle_persona_summon,
-                       handler_info='mycroft.skill.handler', is_intent=True)
-        self.add_event('persona:list', self.handle_persona_list,
-                       handler_info='mycroft.skill.handler', is_intent=True)
-        self.add_event('persona:check', self.handle_persona_check,
-                       handler_info='mycroft.skill.handler', is_intent=True)
-        self.add_event('persona:release', self.handle_persona_release,
-                       handler_info='mycroft.skill.handler', is_intent=True)
-        self.add_event("speak", self.handle_speak)
-        self.add_event("recognizer_loop:utterance", self.handle_utterance)
+        # OVOS-PIPELINE-1 §8: each dispatched persona handler body runs inside a
+        # HandlerLifecycle (see the handlers below), which emits the framework
+        # done-signal (mycroft.skill.handler.start/.complete/.error, keyed by this
+        # service's skill_id) so the orchestrator's IntentDispatcher fires the
+        # §9.5 ovos.utterance.handled end-marker for persona matches.
+        self.bus.on('persona:query', self.handle_persona_query)
+        self.bus.on('persona:summon', self.handle_persona_summon)
+        self.bus.on('persona:list', self.handle_persona_list)
+        self.bus.on('persona:check', self.handle_persona_check)
+        self.bus.on('persona:release', self.handle_persona_release)
+        self.bus.on("speak", self.handle_speak)
+        self.bus.on("recognizer_loop:utterance", self.handle_utterance)
         # OVOS-PERSONA-1 §8.5 out-of-band query / §8.7 discovery (bus-level,
         # outside the pipeline; registered directly on the bus, not as intents)
         self.bus.on("ovos.persona.query", self.handle_oob_query)
         self.bus.on("ovos.persona.list", self.handle_persona_list_request)
         self.load_intent_files()
         self._active_sessions = {}
+
+    @property
+    def lang(self) -> str:
+        """Default language tag, used only as a fallback when a matcher/handler
+        is not given an explicit language (previously provided by the base app)."""
+        return standardize_lang_tag(self.config.get("lang") or
+                                    Configuration().get("lang", "en-US"))
+
+    def _msg_lang(self, message: Optional[Message] = None) -> str:
+        """Resolve the language for a dialog/speak from the message's session,
+        falling back to the service default."""
+        if message is not None:
+            try:
+                return standardize_lang_tag(SessionManager.get(message).lang)
+            except Exception:
+                pass
+        return self.lang
+
+    def _speak(self, utterance: str, message: Optional[Message] = None,
+               lang: Optional[str] = None):
+        """Emit a ``speak`` bus message with the given utterance, forwarding the
+        session/context of ``message`` (replaces OVOSAbstractApplication.speak)."""
+        message = message or dig_for_message() or Message("speak")
+        lang = lang or self._msg_lang(message)
+        self.bus.emit(message.forward("speak",
+                                      {"utterance": utterance,
+                                       "expect_response": False,
+                                       "lang": lang,
+                                       "meta": {"skill": self.skill_id}}))
+
+    def _speak_dialog(self, name: str, data: Optional[Dict] = None,
+                      message: Optional[Message] = None, lang: Optional[str] = None):
+        """Render a dialog via ovos-spec-tools and speak it (replaces
+        OVOSAbstractApplication.speak_dialog). Uses the same locale/.dialog files."""
+        message = message or dig_for_message()
+        lang = lang or self._msg_lang(message)
+        rendered = render(self._locale.load_dialog(name, lang), data or {})
+        self._speak(rendered, message=message, lang=lang)
+
+    def _list_personas(self, message: Optional[Message] = None):
+        """Speak the list of available personas (shared by the persona:list
+        handler and the unknown-persona fallback in persona:query)."""
+        if not self.personas:
+            self._speak_dialog("no_personas", message=message)
+            return
+        self._speak_dialog("list_personas", message=message)
+        for persona in self.personas:
+            self._speak(persona, message=message)
 
     @classmethod
     def load_resource_files(cls):
@@ -279,7 +328,10 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         Returns:
             Session: The same session object with ``persona_id`` updated.
         """
-        sess.persona_id = persona_id or ""
+        # None (not "") on clear: an empty string round-trips through the
+        # spec-tools canonical Session as a malformed value, whereas absent
+        # persona_id is the spec §3 representation of "no active persona".
+        sess.persona_id = persona_id or None
         return sess
 
     def match_persona(self, persona: str):
@@ -402,7 +454,7 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         lang = standardize_lang_tag(lang)
         sess = SessionManager.get(message)
         active_persona = self.get_active_persona(message, include_default=False)
-        if active_persona and self.voc_match(utterances[0], "Release", lang):
+        if active_persona and self._locale.voc_match(utterances[0], "Release", lang):
             # OVOS-PERSONA-1 §6: dismiss clears session.persona_id via
             # Match.updated_session
             return IntentHandlerMatch(match_type='persona:release',
@@ -493,7 +545,7 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
 
         sess = SessionManager.get(message)
         active_persona = self.get_active_persona(message, include_default=False)
-        if active_persona and self.voc_match(utterances[0], "Release", lang):
+        if active_persona and self._locale.voc_match(utterances[0], "Release", lang):
             # OVOS-PERSONA-1 §6: clear session.persona_id on dismiss
             return IntentHandlerMatch(match_type='persona:release',
                                       match_data={"persona": active_persona},
@@ -509,23 +561,23 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
 
             # adapt-like matching for querying a persona
             if any(name.lower() in query for name in self.personas):
-                if (self.voc_match(query, "ask", lang=closest_lang) and
-                        self.voc_match(query, "opinion", lang=closest_lang)):
+                if (self._locale.voc_match(query, "ask", closest_lang) and
+                        self._locale.voc_match(query, "opinion", closest_lang)):
                     for name in self.personas:
                         if name.lower() in query:
-                            query = self.remove_voc(query, "ask", lang=closest_lang)
-                            query = self.remove_voc(query, "opinion", lang=closest_lang)
-                            query = self.remove_voc(query, "persona", lang=closest_lang)
+                            query = self._locale.remove_voc(query, "ask", closest_lang)
+                            query = self._locale.remove_voc(query, "opinion", closest_lang)
+                            query = self._locale.remove_voc(query, "persona", closest_lang)
                             match = {"name": "ask.intent",
                                      "conf": 0.85,
                                      "entities": {"persona": name, "query": query}}
                             break
 
-                elif self.voc_match(query, "summon", lang=closest_lang):
+                elif self._locale.voc_match(query, "summon", closest_lang):
                     for name in self.personas:
                         if name.lower() in query:
-                            query = self.remove_voc(query, "summon", lang=closest_lang)
-                            query = self.remove_voc(query, "persona", lang=closest_lang)
+                            query = self._locale.remove_voc(query, "summon", closest_lang)
+                            query = self._locale.remove_voc(query, "persona", closest_lang)
                             match = {"name": "summon.intent",
                                      "conf": 0.85,
                                      "entities": {"persona": name, "query": query}}
@@ -648,20 +700,21 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
             message (Optional[Message]): Message whose session is used to determine the
                 active persona. If omitted, resolves without a session-specific message.
         """
-        active_persona = self.get_active_persona(message, include_default=False)
-        if active_persona:
-            self.speak_dialog("active_persona", {"persona": active_persona})
-        else:
-            self.speak_dialog("no_active_persona")
+        # OVOS-PIPELINE-1 §8: run the dispatched handler body inside the
+        # framework handler-lifecycle so the done-signal + §9.5 end-marker fire.
+        with HandlerLifecycle(self.bus, message, skill_id=self.skill_id,
+                              data={"name": "PersonaService.handle_persona_check"}):
+            active_persona = self.get_active_persona(message, include_default=False)
+            if active_persona:
+                self._speak_dialog("active_persona", {"persona": active_persona},
+                                   message=message)
+            else:
+                self._speak_dialog("no_active_persona", message=message)
 
     def handle_persona_list(self, message: Optional[Message] = None):
-        if not self.personas:
-            self.speak_dialog("no_personas")
-            return
-
-        self.speak_dialog("list_personas")
-        for persona in self.personas:
-            self.speak(persona)
+        with HandlerLifecycle(self.bus, message, skill_id=self.skill_id,
+                              data={"name": "PersonaService.handle_persona_list"}):
+            self._list_personas(message)
 
     def handle_persona_query(self, message):
         """
@@ -674,31 +727,35 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
                 - data["utterance"]: the user's utterance text to send to the persona.
                 - optional data["lang"]: language code to use for the query; falls back to the session language.
         """
-        if not self.personas:
-            self.speak_dialog("no_personas")
-            return
-
-        persona_id = self.get_active_persona(message, include_default=True)
-        if persona_id not in self.personas:
-            self.speak_dialog("unknown_persona", {"persona": persona_id})
-            self.handle_persona_list()
-            return
-
-        sess = SessionManager.get(message)
-        utt = message.data["utterance"]
-
-        handled = False
-        self._active_sessions[sess.session_id] = True
-        for ans in self.query(utt, persona_id, sess):
-            if not self._active_sessions[sess.session_id]: # stopped
-                LOG.debug(f"Persona stopped: {persona_id}")
+        with HandlerLifecycle(self.bus, message, skill_id=self.skill_id,
+                              data={"name": "PersonaService.handle_persona_query"}):
+            if not self.personas:
+                self._speak_dialog("no_personas", message=message)
                 return
-            if ans:  # might be None
-                self.speak(ans)
-                handled = True
-        if not handled:
-            self.speak_dialog("persona_error", {"persona": persona_id})
-        self._active_sessions[sess.session_id] = False
+
+            persona_id = self.get_active_persona(message, include_default=True)
+            if persona_id not in self.personas:
+                self._speak_dialog("unknown_persona", {"persona": persona_id},
+                                   message=message)
+                self._list_personas(message)
+                return
+
+            sess = SessionManager.get(message)
+            utt = message.data["utterance"]
+
+            handled = False
+            self._active_sessions[sess.session_id] = True
+            for ans in self.query(utt, persona_id, sess):
+                if not self._active_sessions[sess.session_id]: # stopped
+                    LOG.debug(f"Persona stopped: {persona_id}")
+                    return
+                if ans:  # might be None
+                    self._speak(ans, message=message)
+                    handled = True
+            if not handled:
+                self._speak_dialog("persona_error", {"persona": persona_id},
+                                   message=message)
+            self._active_sessions[sess.session_id] = False
 
     def handle_persona_summon(self, message):
         """
@@ -709,27 +766,31 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         Parameters:
             message: Bus message containing at least `data["persona"]` and session information used to scope the activation.
         """
-        if not self.personas:
-            self.speak_dialog("no_personas")
-            return
+        with HandlerLifecycle(self.bus, message, skill_id=self.skill_id,
+                              data={"name": "PersonaService.handle_persona_summon"}):
+            if not self.personas:
+                self._speak_dialog("no_personas", message=message)
+                return
 
-        sess = SessionManager.get(message)
-        persona = message.data["persona"]
-        persona = self.match_persona(persona) or persona
-        if persona not in self.personas:
-            self.speak_dialog("unknown_persona", {"persona": persona})
-        else:
-            LOG.info(f"Persona enabled: {persona}")
-            # session-resident state (OVOS-PERSONA-1 §3); the match phase already
-            # set this via updated_session, mirror it here for handler-side
-            # session mutation (§8.2) and keep the legacy cache in sync
-            sess.persona_id = persona
-            self.active_personas[sess.session_id] = persona
-            self.speak_dialog("activated_persona", {"persona": persona})
-            # OVOS-PERSONA-1 §11: best-effort activation broadcast
-            self.bus.emit(message.forward("ovos.persona.activated",
-                                          {"persona_id": persona,
-                                           "session_id": sess.session_id}))
+            sess = SessionManager.get(message)
+            persona = message.data["persona"]
+            persona = self.match_persona(persona) or persona
+            if persona not in self.personas:
+                self._speak_dialog("unknown_persona", {"persona": persona},
+                                   message=message)
+            else:
+                LOG.info(f"Persona enabled: {persona}")
+                # session-resident state (OVOS-PERSONA-1 §3); the match phase already
+                # set this via updated_session, mirror it here for handler-side
+                # session mutation (§8.2) and keep the legacy cache in sync
+                sess.persona_id = persona
+                self.active_personas[sess.session_id] = persona
+                self._speak_dialog("activated_persona", {"persona": persona},
+                                   message=message)
+                # OVOS-PERSONA-1 §11: best-effort activation broadcast
+                self.bus.emit(message.forward("ovos.persona.activated",
+                                              {"persona_id": persona,
+                                               "session_id": sess.session_id}))
 
     def handle_persona_release(self, message):
         # NOTE: below never happens, this intent only matches if self.active_persona
@@ -742,22 +803,25 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         Parameters:
             message: The incoming message object from the message bus (provides session context).
         """
-        active_persona = self.get_active_persona(message, include_default=False)
-        if not active_persona:
-            self.speak_dialog("no_active_persona")
-            return
-        sess = SessionManager.get(message)
-        LOG.info(f"Releasing Persona: {active_persona}  for session: {sess.session_id}")
-        self.speak_dialog("release_persona", {"persona": active_persona})
-        # clear session-resident state (OVOS-PERSONA-1 §6); the match phase already
-        # cleared this via updated_session, mirror it here and drop the legacy cache
-        sess.persona_id = ""
-        if sess.session_id in self.active_personas:
-            self.active_personas.pop(sess.session_id)
-        # OVOS-PERSONA-1 §11: best-effort dismiss broadcast
-        self.bus.emit(message.forward("ovos.persona.dismissed",
-                                      {"persona_id": active_persona,
-                                       "session_id": sess.session_id}))
+        with HandlerLifecycle(self.bus, message, skill_id=self.skill_id,
+                              data={"name": "PersonaService.handle_persona_release"}):
+            active_persona = self.get_active_persona(message, include_default=False)
+            if not active_persona:
+                self._speak_dialog("no_active_persona", message=message)
+                return
+            sess = SessionManager.get(message)
+            LOG.info(f"Releasing Persona: {active_persona}  for session: {sess.session_id}")
+            self._speak_dialog("release_persona", {"persona": active_persona},
+                               message=message)
+            # clear session-resident state (OVOS-PERSONA-1 §6); the match phase already
+            # cleared this via updated_session, mirror it here and drop the legacy cache
+            sess.persona_id = None
+            if sess.session_id in self.active_personas:
+                self.active_personas.pop(sess.session_id)
+            # OVOS-PERSONA-1 §11: best-effort dismiss broadcast
+            self.bus.emit(message.forward("ovos.persona.dismissed",
+                                          {"persona_id": active_persona,
+                                           "session_id": sess.session_id}))
 
     def stop_session(self, session: Session):
         # since responses are streaming, this will exit the loop in hanle_persona_query
@@ -819,6 +883,18 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         self.bus.emit(message.reply("ovos.persona.list.response",
                                     {"pipeline_id": self.skill_id,
                                      "personas": personas}))
+
+    def shutdown(self):
+        """Remove the bus listeners registered by this service."""
+        self.bus.remove('persona:query', self.handle_persona_query)
+        self.bus.remove('persona:summon', self.handle_persona_summon)
+        self.bus.remove('persona:list', self.handle_persona_list)
+        self.bus.remove('persona:check', self.handle_persona_check)
+        self.bus.remove('persona:release', self.handle_persona_release)
+        self.bus.remove("speak", self.handle_speak)
+        self.bus.remove("recognizer_loop:utterance", self.handle_utterance)
+        self.bus.remove("ovos.persona.query", self.handle_oob_query)
+        self.bus.remove("ovos.persona.list", self.handle_persona_list_request)
 
 
 if __name__ == "__main__":
