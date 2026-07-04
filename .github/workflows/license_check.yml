@@ -8,3 +8,8 @@ on:
 jobs:
   license_check:
     uses: OpenVoiceOS/gh-automations/.github/workflows/license-check.yml@dev
+    with:
+      # marisa-trie is MIT AND (BSD-2-Clause OR LGPL-2.1-or-later): the LGPL is an OR
+      # option, so the effective license is permissive. It is pulled transitively via
+      # ovos-spec-tools. The checker flags the LGPL branch as WeakCopyleft.
+      exclude_packages: '(?i:^marisa[-_.]trie([=<>!~ @;].*)?$)'
