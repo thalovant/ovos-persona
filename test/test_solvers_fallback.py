@@ -224,10 +224,25 @@ def test_persona_stream_uses_configured_fallback(messages):
     ]
 
 
-def test_persona_without_configured_fallback_preserves_empty_result(messages):
+def test_persona_uses_safe_default_fallback(messages):
+    persona = Persona.__new__(Persona)
+    persona.name = "Default Fallback"
+    persona.config = {}
+    persona.solvers = MagicMock()
+    persona.solvers.stream_completion.return_value = iter([])
+    session = MagicMock(lang="en-US", system_unit="metric")
+
+    assert list(persona.stream(messages, session)) == [
+        "I can help you explore this question: what is the capital of france? "
+        "Start by separating what is observed from possible explanations, "
+        "then compare reliable sources."
+    ]
+
+
+def test_persona_can_explicitly_disable_fallback(messages):
     persona = Persona.__new__(Persona)
     persona.name = "No Fallback"
-    persona.config = {}
+    persona.config = {"fallback_response": False}
     persona.solvers = MagicMock()
     persona.solvers.stream_completion.return_value = iter([])
     session = MagicMock(lang="en-US", system_unit="metric")

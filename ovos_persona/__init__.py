@@ -27,6 +27,12 @@ from ovos_workshop.app import OVOSAbstractApplication
 from ovos_persona.memory import BasicShortTermMemory as BasicShortTermMemory
 from ovos_persona.solvers import QuestionSolversService, get_utterance_handler_plugins
 
+DEFAULT_FALLBACK_RESPONSE = (
+    "I can help you explore this question: {utterance} "
+    "Start by separating what is observed from possible explanations, "
+    "then compare reliable sources."
+)
+
 try:
     from ovos_plugin_manager.solvers import find_chat_solver_plugins
 except ImportError:
@@ -86,6 +92,10 @@ class Persona:
     @property
     def fallback_response(self) -> Optional[str]:
         response = self.config.get("fallback_response")
+        if response is False:
+            return None
+        if response is None:
+            response = DEFAULT_FALLBACK_RESPONSE
         return response.strip() if isinstance(response, str) and response.strip() else None
 
     def _fallback_answer(self, messages: List[AgentMessage]) -> Optional[str]:
