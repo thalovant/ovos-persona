@@ -18,7 +18,6 @@ from ovos_plugin_manager.agents import load_memory_plugin
 from ovos_utils.bracket_expansion import expand_template
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.lang import standardize_lang_tag
-from ovos_utils.list_utils import flatten_list
 from ovos_utils.log import LOG
 from ovos_utils.parse import match_one, MatchStrategy
 from ovos_utils.xdg_utils import xdg_data_home
@@ -215,6 +214,43 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
                             intents[lang][f] = samples
         return intents
 
+    @staticmethod
+    def _samples_for(lines: List[str], lang: str, intent_name: str) -> List[str]:
+        """Expand one locale file's templates into training samples.
+
+        Blank lines are dropped before expansion rather than after. A locale
+        file that ends with a newline -- which most editors write, and which
+        twelve of this package's own files had -- yields a final empty line,
+        and ``expand_template("")`` raises ``MalformedTemplate``. That call
+        used to sit outside the try/except below, so one stray blank line did
+        not skip one intent: it aborted ``load_intent_files`` and the whole
+        pipeline plugin failed to construct, leaving
+        ``ovos-persona-pipeline-plugin-high`` and ``-low`` unresolvable for
+        every language on the runtime.
+
+        A template that is malformed for any other reason is logged and
+        skipped, for the same reason: one bad sentence in one translation must
+        not cost every other language its persona.
+
+        Args:
+            lines: raw template lines from the locale file.
+            lang: language tag, for the log line only.
+            intent_name: intent file name, for the log line only.
+
+        Returns:
+            Expanded samples, possibly empty.
+        """
+        samples: List[str] = []
+        for line in lines:
+            if not line or not line.strip():
+                continue
+            try:
+                samples.extend(expand_template(line))
+            except Exception:
+                LOG.error(f"Failed to expand persona template "
+                          f"({lang}, {intent_name}): {line!r}")
+        return samples
+
     def load_intent_files(self):
         # TODO - make intent backend configurable, padatious is not a good choice...
         """
@@ -239,8 +275,8 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
                     # TODO - training hangs due to too many samples
                     #  skip padatious, use keyword matching for these languages for now
                     continue
-                samples = intent_data.get(intent_name) or []
-                samples = flatten_list([expand_template(s) for s in samples])
+                samples = self._samples_for(intent_data.get(intent_name) or [],
+                                            lang=lang, intent_name=intent_name)
                 if samples:
                     LOG.debug(f"registering Persona intent: {intent_name}")
                     try:
