@@ -81,17 +81,36 @@ class Persona:
             return [AgentMessage(MessageRole.USER, utterance)]
         return self.memory.build_conversation_context(utterance, sess.session_id)
 
-    def chat(self, messages: List[AgentMessage], sess: Session) -> str:
-        return self.solvers.chat_completion(messages,
-                                            session_id=sess.session_id,
-                                            lang=sess.lang,
-                                            units=sess.system_unit)
+    @property
+    def fallback_response(self) -> Optional[str]:
+        """The reply to give when no handler answers, or None.
 
-    def stream(self, messages: List[AgentMessage], sess: Session) -> Iterable[str]:
-        return self.solvers.stream_completion(messages,
+        An optional, persona-configured sentence spoken instead of the generic
+        ``persona_error`` dialog, for a persona whose owner wants to say
+        something specific when its backend is down. Unset, blank or not a
+        string means no fallback, and nothing changes.
+        """
+        response = self.config.get("fallback_response")
+        return response.strip() if isinstance(response, str) and response.strip() else None
+
+    def chat(self, messages: List[AgentMessage], sess: Session) -> Optional[str]:
+        answer = self.solvers.chat_completion(messages,
                                               session_id=sess.session_id,
                                               lang=sess.lang,
                                               units=sess.system_unit)
+        return answer or self.fallback_response
+
+    def stream(self, messages: List[AgentMessage], sess: Session) -> Iterable[str]:
+        answered = False
+        for answer in self.solvers.stream_completion(messages,
+                                                     session_id=sess.session_id,
+                                                     lang=sess.lang,
+                                                     units=sess.system_unit):
+            if answer:
+                answered = True
+            yield answer
+        if not answered and self.fallback_response:
+            yield self.fallback_response
 
 
 class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):

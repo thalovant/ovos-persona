@@ -65,6 +65,7 @@ The filename (without `.json`) is used as the persona name unless the JSON provi
 | `handlers` | `List[str]` | **Yes** | Ordered list of utterance handler plugin entry point names |
 | `solvers` | `List[str]` | No | Alias for `handlers` (legacy) |
 | `memory_module` | `str` | No | Memory plugin entry point name. Default: `ovos-agents-short-term-memory-plugin`. Set to `null` to disable. |
+| `fallback_response` | `str` | No | Sentence to speak when no handler produces an answer (for example the backend is down), instead of the generic error dialog. Unset by default. |
 | `<plugin_name>` | `dict` | No | Per-plugin config dict, passed directly to the plugin constructor |
 
 At least one entry in `handlers` / `solvers` is required. If a listed handler is not installed, loading the persona will fail with `ImportError`.
