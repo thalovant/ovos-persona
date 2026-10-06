@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from collections import OrderedDict
 from os.path import join, dirname, expanduser, isdir
 from typing import Optional, Dict, List, Union, Iterable
 
@@ -48,6 +49,21 @@ except ImportError:
 
 class Persona:
     def __init__(self, name, config, blacklist=None):
+        """Build a persona: its memory plugin and its ordered utterance handlers.
+
+        A configured memory plugin that is not installed yet does not fail the
+        persona: it runs without memory, and ``get_messages`` looks for the
+        plugin again later with a backoff.
+
+        Args:
+            name: the persona's name.
+            config: the persona definition (``handlers``/``solvers``,
+                ``memory_module`` and per-plugin config blocks).
+            blacklist: handler plugins never to enable for this persona.
+
+        Raises:
+            ValueError: the definition lists no utterance handler.
+        """
         blacklist = blacklist or []
         self.name = name
         self.config = config
@@ -61,6 +77,12 @@ class Persona:
         self._memory_retry_at = 0.0
         self._memory_retry_interval = 0.0
         self._memory_lock = threading.Lock()
+        # User turns skipped while the plugin was missing, so adoption can
+        # record them: session_id -> (utterance, monotonic time heard). Guarded
+        # by _history_lock, which also makes "is memory set?" and "note the
+        # turn" one step against adoption.
+        self._unrecorded: OrderedDict[str, tuple] = OrderedDict()
+        self._history_lock = threading.Lock()
         if memory_class is None:
             if memory_plugin:
                 LOG.warning(f"memory plugin '{memory_plugin}' not available; short-term memory disabled")
@@ -92,7 +114,55 @@ class Persona:
     #: Ceiling for the backoff below.
     MEMORY_RETRY_MAX_SECONDS = 1800.0
 
-    def _retry_memory_plugin(self, utterance: str, sess: Session) -> None:
+    #: A skipped user turn older than this is no longer in flight, and is not
+    #: written when a late memory plugin is adopted.
+    UNRECORDED_TURN_SECONDS = 300.0
+
+    #: How many sessions' skipped turns are kept while the plugin is missing.
+    UNRECORDED_TURN_SESSIONS = 64
+
+    def _note_unrecorded(self, utterance: str, session_id: str) -> None:
+        """Remember a user turn that no memory recorded. Caller holds ``_history_lock``.
+
+        Keeps the latest turn per session (a newer question replaces an
+        unanswered older one, as ``BasicShortTermMemory`` itself does) for the
+        ``UNRECORDED_TURN_SESSIONS`` most recent sessions, so a plugin that
+        never appears costs a bounded amount of memory.
+
+        Args:
+            utterance: the user turn.
+            session_id: its session.
+        """
+        self._unrecorded.pop(session_id, None)
+        self._unrecorded[session_id] = (utterance, time.monotonic())
+        while len(self._unrecorded) > self.UNRECORDED_TURN_SESSIONS:
+            self._unrecorded.popitem(last=False)
+
+    def record_user_turn(self, utterance: str, session_id: str) -> None:
+        """Record a user turn in memory, or hold it until a late plugin is adopted.
+
+        With memory present this is a plain ``update_history``. With a
+        configured plugin still missing, the turn is kept so that adopting the
+        plugin records it before the answer that ``handle_speak`` writes next;
+        otherwise that answer would sit in history without its question. With
+        no memory configured it does nothing.
+
+        Args:
+            utterance: the user turn.
+            session_id: its session.
+        """
+        with self._history_lock:
+            memory = self.memory
+            if memory is None:
+                if self._memory_plugin:
+                    self._note_unrecorded(utterance, session_id)
+                return
+        memory.update_history(
+            new_messages=[AgentMessage(MessageRole.USER, utterance)],
+            session_id=session_id,
+        )
+
+    def _retry_memory_plugin(self) -> None:
         """Load the configured memory plugin if it has appeared since startup.
 
         Rate-limited: a plugin that is genuinely absent costs one entry-point
@@ -103,13 +173,13 @@ class Persona:
         constructor raises is logged and retried later; the question is
         answered without memory rather than failed.
 
-        On success the triggering user turn is recorded: ``handle_utterance``
-        skipped it while memory was absent, and ``handle_speak`` will record
-        the answer, which would otherwise sit in history without its question.
-
-        Args:
-            utterance: the question being answered.
-            sess: its session.
+        The plugin is adopted only once it holds every recent user turn that
+        was skipped while it was missing (``record_user_turn``), the triggering
+        question and any asked while it was being built. ``handle_speak``
+        records their answers next, and without this they would sit in history
+        without their questions. If that write fails the instance is dropped
+        and the plugin retried after the backoff, exactly like a constructor
+        that raises; the turns stay held for the next attempt.
         """
         # Non-blocking: the lock only has to stop a second instance being
         # built. Waiting on it would hold every other question for this persona
@@ -150,14 +220,24 @@ class Persona:
             except Exception as error:  # a broken plugin must not break the answer
                 LOG.warning(f"memory plugin '{name}' failed to start ({error!r}); retrying later")
                 return
-            try:
-                memory.update_history(
-                    new_messages=[AgentMessage(MessageRole.USER, utterance)],
-                    session_id=sess.session_id,
-                )
-            except Exception as error:
-                LOG.warning(f"memory plugin '{name}' could not record the first turn ({error!r})")
-            self.memory = memory
+            # Under _history_lock, so no turn can be noted after the flush and
+            # before the memory is visible: record_user_turn either sees the
+            # memory or leaves its turn here to be flushed.
+            with self._history_lock:
+                cutoff = time.monotonic() - self.UNRECORDED_TURN_SECONDS
+                try:
+                    for session_id, (turn, heard) in self._unrecorded.items():
+                        if heard >= cutoff:
+                            memory.update_history(
+                                new_messages=[AgentMessage(MessageRole.USER, turn)],
+                                session_id=session_id,
+                            )
+                except Exception as error:
+                    LOG.warning(f"memory plugin '{name}' could not record the turns asked "
+                                f"while it was missing ({error!r}); retrying later")
+                    return
+                self._unrecorded.clear()
+                self.memory = memory
             self._memory_plugin = None
             self._memory_retry_interval = 0.0
             LOG.info(f"memory plugin '{name}' is now available; memory enabled")
@@ -178,7 +258,12 @@ class Persona:
             The messages handed to the solvers.
         """
         if self.memory is None and self._memory_plugin:
-            self._retry_memory_plugin(utterance, sess)
+            # Callers that bypass handle_utterance (query(), the OOB query)
+            # never had the turn noted; the same session keeps one entry.
+            with self._history_lock:
+                if self.memory is None:
+                    self._note_unrecorded(utterance, sess.session_id)
+            self._retry_memory_plugin()
         if self.memory is None:
             return [AgentMessage(MessageRole.USER, utterance)]
         return self.memory.build_conversation_context(utterance, sess.session_id)
@@ -743,11 +828,9 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         sess = SessionManager.get(message)
         persona_id = self.get_active_persona(message, include_default=True)
         persona = self.personas.get(persona_id)
-        if persona and persona.memory:
-            persona.memory.update_history(
-                new_messages=[AgentMessage(MessageRole.USER, utt)],
-                session_id=sess.session_id
-            )
+        if persona:
+            # held, not dropped, while a configured memory plugin is missing
+            persona.record_user_turn(utt, sess.session_id)
 
     def handle_speak(self, message):
         """

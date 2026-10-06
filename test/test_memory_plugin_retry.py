@@ -7,12 +7,14 @@ plugin injects (retrieved knowledge, for one) silently missing.
 """
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from ovos_bus_client import Session
+from ovos_bus_client.message import Message
 from ovos_plugin_manager.templates.agents import AgentMessage, MessageRole
 
-from ovos_persona import Persona
+from ovos_persona import Persona, PersonaService
 from ovos_persona.memory import BasicShortTermMemory
 
 
@@ -93,6 +95,7 @@ def test_the_first_turn_is_recorded_so_the_answer_is_not_orphaned():
 def test_a_plugin_that_fails_to_start_does_not_fail_the_question():
     """The answer goes out without memory; the plugin is tried again later."""
     def broken(config=None):
+        """A plugin constructor that cannot reach its backend."""
         raise RuntimeError("redis down")
 
     persona = _persona(lambda name: None)
@@ -120,6 +123,7 @@ def test_concurrent_questions_build_one_memory():
     persona = _persona(lambda name: None)
 
     def slow_load(name):
+        """Hold the lookup long enough for every thread to arrive."""
         time.sleep(0.05)
         return _Memory
 
@@ -146,7 +150,10 @@ def test_a_slow_plugin_does_not_hold_other_questions():
     constructing = threading.Event()
 
     class _SlowMemory(_Memory):
+        """A memory whose constructor blocks until the test releases it."""
+
         def __init__(self, config=None):
+            """Signal that construction began, then wait for ``release``."""
             constructing.set()
             release.wait(5)
             super().__init__(config=config)
@@ -209,6 +216,7 @@ def test_the_interval_backs_off_while_the_plugin_stays_missing():
 
 
 def test_the_backoff_is_capped():
+    """The interval stops at MEMORY_RETRY_MAX_SECONDS and never passes it."""
     persona = _persona(lambda name: None)
     with patch("ovos_persona.load_memory_plugin", return_value=None):
         for _ in range(40):
@@ -236,3 +244,143 @@ def test_adoption_still_works_after_the_interval_has_grown():
 
     assert persona.memory is not None, "a late plugin was not adopted"
     assert persona._memory_retry_interval == 0.0, "the backoff was not reset"
+
+
+# --------------------------------------------------------------------------
+# The review finding: adoption was not atomic with the user turns it skipped
+# --------------------------------------------------------------------------
+
+
+def _service(persona):
+    """Just enough of a PersonaService for its two history handlers."""
+    return SimpleNamespace(personas={"p": persona},
+                           get_active_persona=lambda message, include_default=True: "p")
+
+
+def _heard(service, utterance, sid):
+    """Deliver ``utterance`` to ``handle_utterance`` as session ``sid``."""
+    PersonaService.handle_utterance(service, Message(
+        "recognizer_loop:utterance", {"utterances": [utterance]},
+        {"session": {"session_id": sid}}))
+
+
+def _spoken(service, utterance, sid):
+    """Deliver ``utterance`` to ``handle_speak`` as session ``sid``."""
+    PersonaService.handle_speak(service, Message(
+        "speak", {"utterance": utterance}, {"session": {"session_id": sid}}))
+
+
+def _turns(persona, sid):
+    """``sid``'s history as (role, content) pairs."""
+    return [(m.role, m.content) for m in persona.memory.get_history(sid)]
+
+
+def test_a_memory_that_cannot_record_the_first_turn_is_not_adopted():
+    """Adopting it anyway put the answer in history without its question.
+
+    The first write failing used to be logged and the memory enabled all the
+    same, so ``handle_speak`` then recorded an assistant turn on its own. Now
+    the memory is adopted only once it holds the turn, and the next attempt
+    (after the backoff) records it.
+    """
+    class _Flaky(_Memory):
+        """Fails its first write, like a store that blips once."""
+
+        failures = 1
+
+        def update_history(self, new_messages, session_id):
+            """Raise while ``failures`` remain, then behave normally."""
+            if type(self).failures:
+                type(self).failures -= 1
+                raise RuntimeError("redis blip")
+            return super().update_history(new_messages, session_id)
+
+    persona = _persona(lambda name: None)
+    service = _service(persona)
+    _heard(service, "what is thalovant", "s1")
+    with patch("ovos_persona.load_memory_plugin", return_value=_Flaky):
+        persona._memory_retry_at = 0.0
+        persona.get_messages("what is thalovant", _session("s1"))
+        assert persona.memory is None, "adopted a memory that lost the turn"
+        assert persona._memory_plugin == "late-memory"
+
+        persona._memory_retry_at = 0.0  # the backoff elapsed
+        persona.get_messages("what is thalovant", _session("s1"))
+    _spoken(service, "A voice platform.", "s1")
+    assert _turns(persona, "s1") == [
+        (MessageRole.USER, "what is thalovant"),
+        (MessageRole.ASSISTANT, "A voice platform.")]
+
+
+def test_questions_asked_while_the_memory_was_built_keep_their_turns():
+    """Only the request that built the memory used to record its question.
+
+    B is heard while A builds the plugin and loses the race for the lock, so it
+    is answered without memory; C is heard during the build too but queried
+    after adoption. ``handle_utterance`` skipped both, and both answers are
+    spoken once the memory exists, so each sat in history alone.
+    """
+    release = threading.Event()
+    constructing = threading.Event()
+
+    class _SlowMemory(_Memory):
+        """Blocks in the constructor until the test releases it."""
+
+        def __init__(self, config=None):
+            """Signal that construction began, then wait for ``release``."""
+            constructing.set()
+            release.wait(5)
+            super().__init__(config=config)
+
+    persona = _persona(lambda name: None)
+    service = _service(persona)
+    with patch("ovos_persona.load_memory_plugin", return_value=_SlowMemory):
+        persona._memory_retry_at = 0.0
+        _heard(service, "first", "A")
+        loader = threading.Thread(target=persona.get_messages,
+                                  args=("first", _session("A")))
+        loader.start()
+        try:
+            assert constructing.wait(5)
+            _heard(service, "second", "B")
+            persona.get_messages("second", _session("B"))
+            _heard(service, "third", "C")
+        finally:
+            release.set()
+            loader.join(5)
+        persona.get_messages("third", _session("C"))
+    for sid, question in (("A", "first"), ("B", "second"), ("C", "third")):
+        _spoken(service, f"answer {sid}", sid)
+        assert _turns(persona, sid) == [
+            (MessageRole.USER, question), (MessageRole.ASSISTANT, f"answer {sid}")], sid
+
+
+def test_only_recent_unrecorded_turns_are_written_on_adoption():
+    """A question answered long before the plugin appeared is not in flight.
+
+    Writing it would leave a stale, unanswered user turn in a store the
+    persona did not have when the question was asked.
+    """
+    persona = _persona(lambda name: None)
+    service = _service(persona)
+    _heard(service, "long ago", "old")
+    persona._unrecorded["old"] = (
+        "long ago", time.monotonic() - persona.UNRECORDED_TURN_SECONDS - 1)
+    _heard(service, "just now", "new")
+    with patch("ovos_persona.load_memory_plugin", return_value=_Memory):
+        persona._memory_retry_at = 0.0
+        persona.get_messages("just now", _session("new"))
+    assert persona.memory.get_history("old") == []
+    assert _turns(persona, "new") == [(MessageRole.USER, "just now")]
+    assert not persona._unrecorded
+
+
+def test_unrecorded_turns_are_bounded_while_the_plugin_stays_missing():
+    """One entry per session, and only the most recent sessions."""
+    persona = _persona(lambda name: None)
+    service = _service(persona)
+    for i in range(persona.UNRECORDED_TURN_SESSIONS + 10):
+        _heard(service, "hi", f"s{i}")
+        _heard(service, "hi again", f"s{i}")
+    assert len(persona._unrecorded) == persona.UNRECORDED_TURN_SESSIONS
+    assert persona._unrecorded[f"s{persona.UNRECORDED_TURN_SESSIONS + 9}"][0] == "hi again"
