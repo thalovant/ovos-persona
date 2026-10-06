@@ -199,6 +199,44 @@ def test_stream_skips_failing_handler(messages):
     assert list(svc.stream_completion(messages)) == ["recovered"]
 
 
+def test_stream_failure_after_partial_answer_is_logged_as_error(messages):
+    """A handler that raises after yielding text leaves the reply cut short: no
+    other handler is tried and Persona.stream skips its fallback, so a configured
+    fallback must not turn this into an INFO "recovered" line."""
+    def _stream_then_fail(*args, **kwargs):
+        yield "Paris is"
+        raise TimeoutError("backend dropped mid-stream")
+
+    broken = MagicMock(spec=ChatEngine)
+    broken.stream_sentences.side_effect = _stream_then_fail
+    unused = MagicMock(spec=ChatEngine)
+    unused.stream_sentences.return_value = iter(["unused"])
+    svc = _service([("broken", broken), ("unused", unused)])
+    svc.fallback_available = True
+
+    with patch("ovos_persona.solvers.LOG") as log:
+        assert list(svc.stream_completion(messages)) == ["Paris is"]
+
+    unused.stream_sentences.assert_not_called()
+    log.info.assert_not_called()
+    log.error.assert_called_once()
+    assert "cut short" in log.error.call_args.args[0]
+
+
+def test_stream_failure_before_another_handler_answers_is_info(messages):
+    boom = MagicMock(spec=ChatEngine)
+    boom.stream_sentences.side_effect = RuntimeError("backend down")
+    ok = MagicMock(spec=ChatEngine)
+    ok.stream_sentences.return_value = iter(["recovered"])
+    svc = _service([("boom", boom), ("ok", ok)])
+
+    with patch("ovos_persona.solvers.LOG") as log:
+        assert list(svc.stream_completion(messages)) == ["recovered"]
+
+    log.info.assert_called_once()
+    log.error.assert_not_called()
+
+
 def test_stream_retrieval_yields_document(messages):
     eng = _retrieval_engine("paris is the capital")
     svc = _service([("retr", eng)])

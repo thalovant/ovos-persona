@@ -102,14 +102,18 @@ class QuestionSolversService:
         self.fallback_available = fallback_available
         self.load_plugins()
 
-    def _log_handler_failures(self, failures, *, recovered=False):
+    def _log_handler_failures(self, failures, *, recovered=False, truncated=False):
         if not failures:
             return
         details = "; ".join(
             f"{module.__class__.__name__}: {error.__class__.__name__}: {error}"
             for module, error in failures
         )
-        if recovered or self.fallback_available:
+        if truncated:
+            # the answer was already partly spoken, so neither another handler
+            # nor the persona's fallback response will run
+            LOG.error(f"Persona handler failed mid-answer; the reply was cut short ({details})")
+        elif recovered or self.fallback_available:
             LOG.info(f"Persona handler unavailable; fallback recovered the query ({details})")
         else:
             LOG.error(f"All persona handlers failed ({details})")
@@ -194,6 +198,7 @@ class QuestionSolversService:
         answered = False
         self.last_error = None
         failures = []
+        truncated = False
         for module in self.modules:
             try:
                 if isinstance(module, (ChatEngine, MultimodalChatEngine)):
@@ -222,6 +227,9 @@ class QuestionSolversService:
             except Exception as e:
                 self.last_error = e
                 failures.append((module, e))
+                if answered:
+                    truncated = True
             if answered:
                 break
-        self._log_handler_failures(failures, recovered=answered)
+        self._log_handler_failures(failures, recovered=answered,
+                                   truncated=truncated)
