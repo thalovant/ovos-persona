@@ -199,7 +199,8 @@ class QuestionSolversService:
         self.last_error = None
         failures = []
         # Persona.stream only counts truthy fragments as an answer and uses its
-        # fallback otherwise, so only those make a later failure a cut-short reply
+        # fallback otherwise, so only those count as recovered, or make a later
+        # failure a cut-short reply
         spoke = False
         truncated = False
         for module in self.modules:
@@ -238,5 +239,5 @@ class QuestionSolversService:
                     truncated = True
             if answered:
                 break
-        self._log_handler_failures(failures, recovered=answered,
+        self._log_handler_failures(failures, recovered=spoke,
                                    truncated=truncated)

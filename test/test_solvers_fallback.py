@@ -251,6 +251,32 @@ def test_stream_failure_after_only_empty_fragments_uses_fallback(messages, fragm
     log.error.assert_not_called()
 
 
+@pytest.mark.parametrize("fragments", [[""], ["", None]])
+def test_stream_failure_after_only_empty_fragments_without_fallback_is_error(
+        messages, fragments):
+    """With the fallback disabled nothing answers, so the failure is not recovered."""
+    def _empty_then_fail(*args, **kwargs):
+        yield from fragments
+        raise TimeoutError("backend dropped mid-stream")
+
+    broken = MagicMock(spec=ChatEngine)
+    broken.stream_sentences.side_effect = _empty_then_fail
+    svc = _service([("broken", broken)])
+    svc.fallback_available = False
+    persona = Persona.__new__(Persona)
+    persona.name = "No Fallback After Empty Stream"
+    persona.config = {"fallback_response": False}
+    persona.solvers = svc
+    session = MagicMock(lang="en-US", system_unit="metric")
+
+    with patch("ovos_persona.solvers.LOG") as log:
+        assert list(persona.stream(messages, session)) == []
+
+    log.info.assert_not_called()
+    log.error.assert_called_once()
+    assert "All persona handlers failed" in log.error.call_args.args[0]
+
+
 def test_stream_failure_before_another_handler_answers_is_info(messages):
     boom = MagicMock(spec=ChatEngine)
     boom.stream_sentences.side_effect = RuntimeError("backend down")
