@@ -198,6 +198,9 @@ class QuestionSolversService:
         answered = False
         self.last_error = None
         failures = []
+        # Persona.stream only counts truthy fragments as an answer and uses its
+        # fallback otherwise, so only those make a later failure a cut-short reply
+        spoke = False
         truncated = False
         for module in self.modules:
             try:
@@ -207,27 +210,31 @@ class QuestionSolversService:
                                                     lang=lang, units=units):
 
                         answered = True
+                        spoke = spoke or bool(response)
                         yield response
                 elif isinstance(module, (RetrievalEngine, DocumentIndexerEngine, QAIndexerEngine)):
                     document, conf = module.query(messages[-1].content,
                                                   lang=lang, k=1)[0]
                     answered = True
+                    spoke = spoke or bool(document)
                     yield document
                 elif isinstance(module, ChatMessageSolver):
                     for ans in module.stream_chat_utterances(messages=messages, lang=lang, units=units):
                         answered = True
+                        spoke = spoke or bool(ans)
                         yield ans
                 elif isinstance(module, QuestionSolver):
                     LOG.debug(f"{module} does not supported chat history!")
                     query = messages[-1].content
                     for ans in module.stream_utterances(query, lang=lang, units=units):
                         answered = True
+                        spoke = spoke or bool(ans)
                         yield ans
 
             except Exception as e:
                 self.last_error = e
                 failures.append((module, e))
-                if answered:
+                if spoke:
                     truncated = True
             if answered:
                 break
