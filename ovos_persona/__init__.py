@@ -511,6 +511,10 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         Returns:
             IntentHandlerMatch or None: An IntentHandlerMatch for handled persona intents (`persona:release`, `persona:summon`, `persona:list`, `persona:check`, `persona:query`) or `None` if no high-priority persona intent was matched.
         """
+        if not utterances:
+            # same reason as handle_utterance: nothing was said, so there is
+            # nothing to match. Every branch below reads utterances[0].
+            return None
         lang = lang or self.lang
         lang = standardize_lang_tag(lang)
         sess = SessionManager.get(message)
@@ -601,6 +605,10 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         Returns:
             IntentHandlerMatch or None: An IntentHandlerMatch for 'persona:release', 'persona:summon', or 'persona:query' when a medium-priority persona intent is found, otherwise None.
         """
+        if not utterances:
+            # same reason as match_high: nothing was said, so there is nothing
+            # to match. Every branch below reads utterances[0].
+            return None
         lang = lang or self.lang
         lang = standardize_lang_tag(lang)
 
@@ -686,6 +694,10 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         Returns:
             Optional[IntentHandlerMatch]: An IntentHandlerMatch of type "persona:query" when a fallback persona is resolved, `None` if no persona match or fallback is applicable.
         """
+        if not utterances:
+            # the last resort still has nothing to answer, and the match it
+            # would build reads utterances[0] twice.
+            return None
         match = self.match_medium(utterances, lang, message)
         if match:
             return match
@@ -720,7 +732,14 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         Side effects:
             Appends a tuple `("user", utterance)` to `self.message_history[session_id]`.
         """
-        utt = message.data.get("utterances")[0]
+        utterances = message.data.get("utterances") or []
+        if not utterances:
+            # a recognizer_loop:utterance carrying an empty list, or none at
+            # all, is nothing to answer: there is no user turn to remember.
+            # Indexing it raised IndexError here and lost the message.
+            LOG.debug("no utterance to record in the session history")
+            return
+        utt = utterances[0]
         sess = SessionManager.get(message)
         persona_id = self.get_active_persona(message, include_default=True)
         persona = self.personas.get(persona_id)
@@ -871,6 +890,26 @@ class PersonaService(ConfidenceMatcherPipeline, OVOSAbstractApplication):
         self.bus.emit(message.forward("ovos.persona.dismissed",
                                       {"persona_id": active_persona,
                                        "session_id": sess.session_id}))
+
+    def can_stop(self, message: Message) -> bool:
+        """
+        Whether a stop request should reach this service for the message's session.
+
+        ovos-workshop requires ``can_stop`` of every skill that implements
+        ``stop_session``: without it the stop pipeline's ``ovos.stop.ping`` raised
+        ``NotImplementedError`` whenever the persona was the active skill, and
+        "stop" could not interrupt a persona answer. A persona is stoppable
+        exactly while an answer is still streaming for that session -- the state
+        ``stop_session`` clears.
+
+        Parameters:
+            message (Message): the stop ping; its session is resolved via SessionManager.
+
+        Returns:
+            bool: ``True`` while a persona answer is streaming for the session.
+        """
+        sess = SessionManager.get(message)
+        return bool(self._active_sessions.get(sess.session_id))
 
     def stop_session(self, session: Session):
         # since responses are streaming, this will exit the loop in hanle_persona_query
